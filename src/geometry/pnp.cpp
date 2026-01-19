@@ -17,21 +17,40 @@ PnPRansacResult SolvePnPRansacOpenCV(const Intrinsics& intr,
     return out;
   }
 
-  std::vector<cv::Point3d> obj;
-  std::vector<cv::Point2d> img;
-  obj.reserve(X_world.size());
-  img.reserve(uv_px.size());
+  const size_t N = X_world.size();
 
-  for (size_t i = 0; i < X_world.size(); ++i) {
-    obj.emplace_back(X_world[i].x(), X_world[i].y(), X_world[i].z());
-    img.emplace_back(uv_px[i].x(), uv_px[i].y());
+  // Use thread-local buffers to avoid repeated allocation across calls
+  // This is particularly important in incremental SfM where PnP is called per-image
+  thread_local std::vector<cv::Point3d> obj;
+  thread_local std::vector<cv::Point2d> img;
+
+  obj.resize(N);
+  img.resize(N);
+
+  // Direct assignment is faster than emplace_back with re-allocation checks
+  for (size_t i = 0; i < N; ++i) {
+    obj[i].x = X_world[i].x();
+    obj[i].y = X_world[i].y();
+    obj[i].z = X_world[i].z();
+    img[i].x = uv_px[i].x();
+    img[i].y = uv_px[i].y();
   }
 
-  cv::Mat K = (cv::Mat_<double>(3, 3) << intr.f_px, 0, intr.cx_px,
-                0, intr.f_px, intr.cy_px,
-                0, 0, 1);
+  // Pre-allocate intrinsic matrix - use thread-local to avoid repeated allocation
+  thread_local cv::Mat K(3, 3, CV_64F);
+  thread_local cv::Mat dist(1, 5, CV_64F);
 
-  cv::Mat dist = (cv::Mat_<double>(1, 5) << intr.k1, intr.k2, 0.0, 0.0, 0.0);
+  double* K_data = K.ptr<double>();
+  K_data[0] = intr.f_px; K_data[1] = 0;          K_data[2] = intr.cx_px;
+  K_data[3] = 0;         K_data[4] = intr.f_px;  K_data[5] = intr.cy_px;
+  K_data[6] = 0;         K_data[7] = 0;          K_data[8] = 1;
+
+  double* dist_data = dist.ptr<double>();
+  dist_data[0] = intr.k1;
+  dist_data[1] = intr.k2;
+  dist_data[2] = 0.0;
+  dist_data[3] = 0.0;
+  dist_data[4] = 0.0;
 
   cv::Mat rvec, tvec, inliers;
 
@@ -55,23 +74,23 @@ PnPRansacResult SolvePnPRansacOpenCV(const Intrinsics& intr,
     return out;
   }
 
-  cv::Mat Rcv;
+  // Use thread-local rotation matrix
+  thread_local cv::Mat Rcv(3, 3, CV_64F);
   cv::Rodrigues(rvec, Rcv);
 
-  Eigen::Matrix3d R;
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      R(r, c) = Rcv.at<double>(r, c);
-    }
-  }
+  // Direct copy from cv::Mat to Eigen - avoid element-by-element access
+  const double* R_data = Rcv.ptr<double>();
+  out.R << R_data[0], R_data[1], R_data[2],
+           R_data[3], R_data[4], R_data[5],
+           R_data[6], R_data[7], R_data[8];
 
   out.success = true;
-  out.R = R;
   out.t = Eigen::Vector3d(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
 
-  out.inlier_indices.reserve(inliers.rows);
+  out.inlier_indices.resize(inliers.rows);
+  const int* inlier_data = inliers.ptr<int>();
   for (int i = 0; i < inliers.rows; ++i) {
-    out.inlier_indices.push_back(inliers.at<int>(i, 0));
+    out.inlier_indices[i] = inlier_data[i];
   }
 
   return out;

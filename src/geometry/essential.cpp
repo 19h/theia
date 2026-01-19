@@ -72,11 +72,26 @@ CheiralityResult ChooseRelativePoseCheirality(const Eigen::Matrix3d& E,
   const int N = static_cast<int>(x1_px.size());
   const int max_test = std::min(N, 200);
 
-  const Eigen::Matrix<double, 3, 4> P1 =
+  // Early exit threshold: if we find a pose with >80% positive depth, use it
+  const int early_exit_threshold = static_cast<int>(max_test * 0.8);
+
+  // Pre-compute P1 (identity projection)
+  static const Eigen::Matrix<double, 3, 4> P1 =
       (Eigen::Matrix<double, 3, 4>() << 1, 0, 0, 0,
                                         0, 1, 0, 0,
                                         0, 0, 1, 0)
           .finished();
+
+  // Pre-compute undistorted normalized coordinates (once, used for all poses)
+  // This eliminates 4x redundant undistortion for each point
+  thread_local std::vector<Eigen::Vector2d> n1_cache, n2_cache;
+  n1_cache.resize(max_test);
+  n2_cache.resize(max_test);
+
+  for (int i = 0; i < max_test; ++i) {
+    n1_cache[i] = PixelToUndistortedNormalized(intr1, x1_px[i]);
+    n2_cache[i] = PixelToUndistortedNormalized(intr2, x2_px[i]);
+  }
 
   CheiralityResult best;
   best.num_positive_depth = -1;
@@ -86,22 +101,31 @@ CheiralityResult ChooseRelativePoseCheirality(const Eigen::Matrix3d& E,
     P2.block<3, 3>(0, 0) = pose.R;
     P2.col(3) = pose.t;
 
+    // Extract R row 2 and t[2] for fast z2 computation
+    const double R20 = pose.R(2, 0), R21 = pose.R(2, 1), R22 = pose.R(2, 2);
+    const double t2 = pose.t.z();
+
     int positive = 0;
     for (int i = 0; i < max_test; ++i) {
-      const Eigen::Vector2d n1 = PixelToUndistortedNormalized(intr1, x1_px[i]);
-      const Eigen::Vector2d n2 = PixelToUndistortedNormalized(intr2, x2_px[i]);
-
       Eigen::Vector3d X;
-      if (!TriangulateDLT(P1, P2, n1, n2, &X)) continue;
+      if (!TriangulateDLT(P1, P2, n1_cache[i], n2_cache[i], &X)) continue;
 
+      // z1 = X.z() for identity camera
+      // z2 = R[2,:] * X + t[2] - computed directly without full matrix multiply
       const double z1 = X.z();
-      const double z2 = (pose.R * X + pose.t).z();
+      const double z2 = R20 * X.x() + R21 * X.y() + R22 * X.z() + t2;
+
       if (z1 > 0 && z2 > 0) positive++;
     }
 
     if (positive > best.num_positive_depth) {
       best.pose = pose;
       best.num_positive_depth = positive;
+
+      // Early exit: if this pose has enough positive depth, use it
+      if (positive >= early_exit_threshold) {
+        return best;
+      }
     }
   }
 

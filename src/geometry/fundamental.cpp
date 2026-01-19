@@ -4,6 +4,7 @@
 #include <limits>
 #include <psynth/common.hpp>
 #include <psynth/geometry/fundamental.hpp>
+#include <psynth/simd/simd.hpp>
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -158,48 +159,135 @@ double SampsonDistanceSquared(const Eigen::Matrix3d& F, const Eigen::Vector2d& x
   const double denom = Fx1_0 * Fx1_0 + Fx1_1 * Fx1_1 + Ftx2_0 * Ftx2_0 + Ftx2_1 * Ftx2_1;
 
   if (denom <= std::numeric_limits<double>::epsilon()) {
-    return std::numeric_limits<double>::infinity();
+    return std::numeric_limits<double>::max();
   }
   return (x2tFx1 * x2tFx1) / denom;
 }
 
-// Batch Sampson distance computation for SIMD-friendly inlier counting
+// Batch Sampson distance computation with SIMD optimization
 // Returns count of inliers and populates inlier_indices
 int CountInliersFast(const Eigen::Matrix3d& F, const std::vector<Eigen::Vector2d>& x1_px,
                      const std::vector<Eigen::Vector2d>& x2_px, double thresh2,
                      std::vector<int>& inlier_indices) {
   inlier_indices.clear();
   const int N = static_cast<int>(x1_px.size());
+  if (N == 0) return 0;
 
-  // Extract F matrix elements for scalar computation
+  inlier_indices.reserve(N / 2);  // Expect ~50% inliers on average
+
+  // Extract F matrix elements for vectorized computation
   const double F00 = F(0, 0), F01 = F(0, 1), F02 = F(0, 2);
   const double F10 = F(1, 0), F11 = F(1, 1), F12 = F(1, 2);
   const double F20 = F(2, 0), F21 = F(2, 1), F22 = F(2, 2);
 
-  for (int i = 0; i < N; ++i) {
-    const double x1 = x1_px[i].x(), y1 = x1_px[i].y();
-    const double x2 = x2_px[i].x(), y2 = x2_px[i].y();
+#if defined(PSYNTH_SIMD_AVX2) || defined(PSYNTH_SIMD_AVX512)
+  // AVX2 path: process 4 correspondences at a time
+  using namespace simd;
 
-    // Fx1 = F * [x1, y1, 1]^T
+  const Double4 vF00(F00), vF01(F01), vF02(F02);
+  const Double4 vF10(F10), vF11(F11), vF12(F12);
+  const Double4 vF20(F20), vF21(F21), vF22(F22);
+  const Double4 vthresh2(thresh2);
+  const Double4 eps(std::numeric_limits<double>::epsilon());
+
+  // Convert input to SoA for SIMD - use thread-local to avoid allocation
+  thread_local std::vector<double> x1_x, x1_y, x2_x, x2_y;
+  x1_x.resize(N);
+  x1_y.resize(N);
+  x2_x.resize(N);
+  x2_y.resize(N);
+
+  for (int i = 0; i < N; ++i) {
+    x1_x[i] = x1_px[i].x();
+    x1_y[i] = x1_px[i].y();
+    x2_x[i] = x2_px[i].x();
+    x2_y[i] = x2_px[i].y();
+  }
+
+  const int N4 = N & ~3;
+  for (int i = 0; i < N4; i += 4) {
+    // Prefetch next cache line
+    if (i + 16 < N) {
+      prefetch_read(&x1_x[i + 16]);
+      prefetch_read(&x2_x[i + 16]);
+    }
+
+    const Double4 px1 = Double4::load(&x1_x[i]);
+    const Double4 py1 = Double4::load(&x1_y[i]);
+    const Double4 px2 = Double4::load(&x2_x[i]);
+    const Double4 py2 = Double4::load(&x2_y[i]);
+
+    // Fx1 = F * [x1, y1, 1]^T using FMA
+    const Double4 Fx1_0 = fmadd(vF00, px1, fmadd(vF01, py1, vF02));
+    const Double4 Fx1_1 = fmadd(vF10, px1, fmadd(vF11, py1, vF12));
+    const Double4 Fx1_2 = fmadd(vF20, px1, fmadd(vF21, py1, vF22));
+
+    // Ftx2 = F^T * [x2, y2, 1]^T
+    const Double4 Ftx2_0 = fmadd(vF00, px2, fmadd(vF10, py2, vF20));
+    const Double4 Ftx2_1 = fmadd(vF01, px2, fmadd(vF11, py2, vF21));
+
+    // x2^T * F * x1
+    const Double4 x2tFx1 = fmadd(px2, Fx1_0, fmadd(py2, Fx1_1, Fx1_2));
+
+    // Denominator
+    const Double4 denom = fmadd(Fx1_0, Fx1_0, fmadd(Fx1_1, Fx1_1,
+                          fmadd(Ftx2_0, Ftx2_0, Ftx2_1 * Ftx2_1)));
+
+    // Check inlier condition: num² < thresh² × denom && denom > eps
+    const Double4 num2 = x2tFx1 * x2tFx1;
+    const Double4 rhs = vthresh2 * denom;
+    const Double4 valid_denom = denom > eps;
+    const Double4 valid_dist = num2 < rhs;
+    const Double4 is_inlier = valid_denom & valid_dist;
+
+    const int mask = is_inlier.movemask();
+    if (mask & 1) inlier_indices.push_back(i);
+    if (mask & 2) inlier_indices.push_back(i + 1);
+    if (mask & 4) inlier_indices.push_back(i + 2);
+    if (mask & 8) inlier_indices.push_back(i + 3);
+  }
+
+  // Handle remainder with scalar code
+  for (int i = N4; i < N; ++i) {
+    const double x1 = x1_x[i], y1 = x1_y[i];
+    const double x2 = x2_x[i], y2 = x2_y[i];
+
     const double Fx1_0 = F00 * x1 + F01 * y1 + F02;
     const double Fx1_1 = F10 * x1 + F11 * y1 + F12;
     const double Fx1_2 = F20 * x1 + F21 * y1 + F22;
 
-    // Ftx2 = F^T * [x2, y2, 1]^T
     const double Ftx2_0 = F00 * x2 + F10 * y2 + F20;
     const double Ftx2_1 = F01 * x2 + F11 * y2 + F21;
 
-    // x2^T * F * x1
     const double x2tFx1 = x2 * Fx1_0 + y2 * Fx1_1 + Fx1_2;
-
     const double denom = Fx1_0 * Fx1_0 + Fx1_1 * Fx1_1 + Ftx2_0 * Ftx2_0 + Ftx2_1 * Ftx2_1;
 
-    // Avoid division when possible - multiply instead
-    // d2 < thresh2  =>  x2tFx1^2 < thresh2 * denom
     if (denom > std::numeric_limits<double>::epsilon() && x2tFx1 * x2tFx1 < thresh2 * denom) {
       inlier_indices.push_back(i);
     }
   }
+#else
+  // Scalar fallback for non-AVX systems
+  for (int i = 0; i < N; ++i) {
+    const double x1 = x1_px[i].x(), y1 = x1_px[i].y();
+    const double x2 = x2_px[i].x(), y2 = x2_px[i].y();
+
+    const double Fx1_0 = F00 * x1 + F01 * y1 + F02;
+    const double Fx1_1 = F10 * x1 + F11 * y1 + F12;
+    const double Fx1_2 = F20 * x1 + F21 * y1 + F22;
+
+    const double Ftx2_0 = F00 * x2 + F10 * y2 + F20;
+    const double Ftx2_1 = F01 * x2 + F11 * y2 + F21;
+
+    const double x2tFx1 = x2 * Fx1_0 + y2 * Fx1_1 + Fx1_2;
+    const double denom = Fx1_0 * Fx1_0 + Fx1_1 * Fx1_1 + Ftx2_0 * Ftx2_0 + Ftx2_1 * Ftx2_1;
+
+    if (denom > std::numeric_limits<double>::epsilon() && x2tFx1 * x2tFx1 < thresh2 * denom) {
+      inlier_indices.push_back(i);
+    }
+  }
+#endif
+
   return static_cast<int>(inlier_indices.size());
 }
 

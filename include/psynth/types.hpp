@@ -6,10 +6,68 @@
 #include <opencv2/features2d.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
 namespace psynth {
+
+// ============================================================================
+// Cache-line and SIMD alignment utilities
+// ============================================================================
+
+constexpr size_t kCacheLineSize = 64;
+constexpr size_t kSimdAlignment = 32;
+
+// Aligned allocator for STL containers
+template <typename T, size_t Alignment = kSimdAlignment>
+struct AlignedAllocator {
+  using value_type = T;
+
+  AlignedAllocator() noexcept = default;
+
+  template <typename U>
+  AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+
+  T* allocate(std::size_t n) {
+    void* ptr = nullptr;
+#if defined(_MSC_VER)
+    ptr = _aligned_malloc(n * sizeof(T), Alignment);
+    if (!ptr) throw std::bad_alloc();
+#else
+    if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0)
+      throw std::bad_alloc();
+#endif
+    return static_cast<T*>(ptr);
+  }
+
+  void deallocate(T* ptr, std::size_t) noexcept {
+#if defined(_MSC_VER)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+  }
+
+  template <typename U>
+  struct rebind {
+    using other = AlignedAllocator<U, Alignment>;
+  };
+};
+
+template <typename T, typename U, size_t A>
+bool operator==(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) noexcept {
+  return true;
+}
+
+template <typename T, typename U, size_t A>
+bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) noexcept {
+  return false;
+}
+
+// Aligned vector type alias
+template <typename T>
+using AlignedVector = std::vector<T, AlignedAllocator<T>>;
 
 using ImageId = int;
 

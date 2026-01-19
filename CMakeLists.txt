@@ -8,6 +8,58 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PSYNTH_BUILD_APPS "Build CLI applications" ON)
 option(PSYNTH_BUILD_VIEWER "Build interactive 3D viewer" ON)
+option(PSYNTH_ENABLE_LTO "Enable Link-Time Optimization" ON)
+option(PSYNTH_ENABLE_NATIVE "Enable native CPU optimizations" ON)
+
+# ============================================================================
+# Compiler optimization flags
+# ============================================================================
+
+# Add aggressive optimization flags for Release builds
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # Aggressive optimization flags
+    add_compile_options(-O3)
+
+    # Enable native CPU optimizations (AVX2, etc.) if requested
+    if(PSYNTH_ENABLE_NATIVE)
+      include(CheckCXXCompilerFlag)
+      check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+      if(COMPILER_SUPPORTS_MARCH_NATIVE)
+        add_compile_options(-march=native)
+        message(STATUS "Enabled native CPU optimizations (-march=native)")
+      endif()
+    endif()
+
+    # Fast math (safe for our numerical code)
+    add_compile_options(-ffast-math)
+
+    # Unroll loops
+    add_compile_options(-funroll-loops)
+
+    # Vectorization hints
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      add_compile_options(-fvectorize -fslp-vectorize)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+      add_compile_options(-ftree-vectorize)
+    endif()
+
+  elseif(MSVC)
+    add_compile_options(/O2 /fp:fast /arch:AVX2)
+  endif()
+endif()
+
+# Link-Time Optimization
+if(PSYNTH_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+  if(LTO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "Link-Time Optimization (LTO) enabled")
+  else()
+    message(WARNING "LTO not supported: ${LTO_ERROR}")
+  endif()
+endif()
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc features2d calib3d flann)
 find_package(Eigen3 REQUIRED)

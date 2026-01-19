@@ -70,15 +70,20 @@ bool TriangulateDLT(const Eigen::Matrix<double, 3, 4>& P1,
 }
 
 double TriangulationAngleRad(const Eigen::Vector3d& C1, const Eigen::Vector3d& C2, const Eigen::Vector3d& X) {
-  const Eigen::Vector3d v1 = (X - C1);
-  const Eigen::Vector3d v2 = (X - C2);
-  const double n1 = v1.norm();
-  const double n2 = v2.norm();
-  if (n1 <= 0 || n2 <= 0) return 0.0;
+  // Use atan2(cross_mag, dot) instead of acos(dot/(n1*n2)) for better numerical stability
+  // This avoids:
+  // 1. Division by small norms
+  // 2. Clamping artifacts near +/-1
+  // 3. Loss of precision for small angles
 
-  double c = v1.dot(v2) / (n1 * n2);
-  c = std::max(-1.0, std::min(1.0, c));
-  return std::acos(c);
+  const Eigen::Vector3d v1 = X - C1;
+  const Eigen::Vector3d v2 = X - C2;
+
+  const double dot = v1.dot(v2);
+  const double cross_mag = v1.cross(v2).norm();
+
+  // atan2 handles all edge cases gracefully
+  return std::atan2(cross_mag, dot);
 }
 
 Eigen::Vector2d ProjectPointPx(const Camera& cam, const Eigen::Vector3d& X_world) {
@@ -109,7 +114,7 @@ Eigen::Vector2d ProjectPointPx(const Camera& cam, const Eigen::Vector3d& X_world
 
 double ReprojectionErrorPx(const Camera& cam, const Eigen::Vector3d& X_world, const Eigen::Vector2d& uv_obs_px) {
   const Eigen::Vector2d uv_pred = ProjectPointPx(cam, X_world);
-  if (!std::isfinite(uv_pred.x()) || !std::isfinite(uv_pred.y())) return std::numeric_limits<double>::infinity();
+  if (!std::isfinite(uv_pred.x()) || !std::isfinite(uv_pred.y())) return std::numeric_limits<double>::max();
   return (uv_pred - uv_obs_px).norm();
 }
 

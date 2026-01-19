@@ -538,23 +538,70 @@ void IncrementalSfM::TriangulateNewTracks(Reconstruction* rec) {
     if (obs_reg.size() < 2) continue;
 
     // Find widest baseline pair using cached camera centers
+    // Optimization: For tracks with many observations (>10), use heuristic instead of O(n²)
     double best_baseline2 = -1.0;
     const Observation* oa = nullptr;
     const Observation* ob = nullptr;
 
     const size_t n_obs = obs_reg.size();
-    for (size_t a = 0; a < n_obs; ++a) {
-      const Eigen::Vector3d& Ca = camera_centers.at(obs_reg[a]->image_id);
-      for (size_t b = a + 1; b < n_obs; ++b) {
-        const Eigen::Vector3d& Cb = camera_centers.at(obs_reg[b]->image_id);
+
+    if (n_obs <= 10) {
+      // Small number of observations: full O(n²) search is fast
+      for (size_t a = 0; a < n_obs; ++a) {
+        const Eigen::Vector3d& Ca = camera_centers.at(obs_reg[a]->image_id);
+        for (size_t b = a + 1; b < n_obs; ++b) {
+          const Eigen::Vector3d& Cb = camera_centers.at(obs_reg[b]->image_id);
+          const double d2 = (Ca - Cb).squaredNorm();
+          if (d2 > best_baseline2) {
+            best_baseline2 = d2;
+            oa = obs_reg[a];
+            ob = obs_reg[b];
+          }
+        }
+      }
+    } else {
+      // Many observations: use O(n) heuristic based on bounding box extremes
+      // Find cameras at min/max x, y, z positions - one of these pairs likely has widest baseline
+      const Observation* min_x = obs_reg[0];
+      const Observation* max_x = obs_reg[0];
+      const Observation* min_y = obs_reg[0];
+      const Observation* max_y = obs_reg[0];
+      const Observation* min_z = obs_reg[0];
+      const Observation* max_z = obs_reg[0];
+
+      double mx = camera_centers.at(obs_reg[0]->image_id).x();
+      double Mx = mx, my = camera_centers.at(obs_reg[0]->image_id).y();
+      double My = my, mz = camera_centers.at(obs_reg[0]->image_id).z();
+      double Mz = mz;
+
+      for (size_t i = 1; i < n_obs; ++i) {
+        const Eigen::Vector3d& C = camera_centers.at(obs_reg[i]->image_id);
+        if (C.x() < mx) { mx = C.x(); min_x = obs_reg[i]; }
+        if (C.x() > Mx) { Mx = C.x(); max_x = obs_reg[i]; }
+        if (C.y() < my) { my = C.y(); min_y = obs_reg[i]; }
+        if (C.y() > My) { My = C.y(); max_y = obs_reg[i]; }
+        if (C.z() < mz) { mz = C.z(); min_z = obs_reg[i]; }
+        if (C.z() > Mz) { Mz = C.z(); max_z = obs_reg[i]; }
+      }
+
+      // Check the 3 candidate pairs (min/max for each axis)
+      auto check_pair = [&](const Observation* a, const Observation* b) {
+        if (a == b) return;
+        const Eigen::Vector3d& Ca = camera_centers.at(a->image_id);
+        const Eigen::Vector3d& Cb = camera_centers.at(b->image_id);
         const double d2 = (Ca - Cb).squaredNorm();
         if (d2 > best_baseline2) {
           best_baseline2 = d2;
-          oa = obs_reg[a];
-          ob = obs_reg[b];
+          oa = a;
+          ob = b;
         }
-      }
+      };
+
+      check_pair(min_x, max_x);
+      check_pair(min_y, max_y);
+      check_pair(min_z, max_z);
     }
+
     if (!oa || !ob) continue;
 
     const auto& cam1 = rec->cameras.at(oa->image_id);
