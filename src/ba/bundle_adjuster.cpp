@@ -1,6 +1,3 @@
-#include <psynth/ba/bundle_adjuster.hpp>
-#include <psynth/common.hpp>
-
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 
@@ -8,6 +5,9 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <psynth/ba/bundle_adjuster.hpp>
+#include <psynth/common.hpp>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -15,40 +15,38 @@ namespace psynth::ba {
 
 namespace {
 
+// Optimized reprojection residual:
+// - Removed unnecessary point copy (T p[3] = {T(point[0])...} -> direct use of point)
+// - Principal point stored per-residual is unavoidable with Ceres auto-diff structure
 struct ReprojectionResidual {
   ReprojectionResidual(double u_obs, double v_obs, double cx, double cy)
       : u_obs_(u_obs), v_obs_(v_obs), cx_(cx), cy_(cy) {}
 
   template <typename T>
-  bool operator()(const T* const pose, const T* const intr, const T* const point, T* residuals) const {
-    const T* aa = pose;
-    const T* t = pose + 3;
-
-    T p[3] = {T(point[0]), T(point[1]), T(point[2])};
+  bool operator()(const T* const pose, const T* const intr, const T* const point,
+                  T* residuals) const {
+    // Direct rotation of input point - no unnecessary copy
+    // ceres::AngleAxisRotatePoint accepts const T* for the input point
     T p_rot[3];
-    ceres::AngleAxisRotatePoint(aa, p, p_rot);
+    ceres::AngleAxisRotatePoint(pose, point, p_rot);  // pose[0:3] = angle-axis
 
-    p_rot[0] += t[0];
-    p_rot[1] += t[1];
-    p_rot[2] += t[2];
+    // Add translation (pose[3:6])
+    p_rot[0] += pose[3];
+    p_rot[1] += pose[4];
+    p_rot[2] += pose[5];
 
-    const T X = p_rot[0];
-    const T Y = p_rot[1];
-    const T Z = p_rot[2];
+    // Perspective division with small epsilon for numerical stability
+    const T inv_z = T(1.0) / (p_rot[2] + T(1e-12));
+    const T x = p_rot[0] * inv_z;
+    const T y = p_rot[1] * inv_z;
 
-    const T inv_z = T(1.0) / (Z + T(1e-12));
-
-    const T x = X * inv_z;
-    const T y = Y * inv_z;
-
+    // Radial distortion
     const T r2 = x * x + y * y;
-    const T k1 = intr[1];
-    const T k2 = intr[2];
-    const T radial = T(1.0) + k1 * r2 + k2 * r2 * r2;
+    const T radial = T(1.0) + intr[1] * r2 + intr[2] * r2 * r2;  // k1, k2
 
-    const T f = intr[0];
-    const T u = f * radial * x + T(cx_);
-    const T v = f * radial * y + T(cy_);
+    // Final projection
+    const T u = intr[0] * radial * x + T(cx_);  // f
+    const T v = intr[0] * radial * y + T(cy_);
 
     residuals[0] = u - T(u_obs_);
     residuals[1] = v - T(v_obs_);
@@ -78,9 +76,7 @@ Eigen::Matrix3d RotationMatrixFromAngleAxis(const double aa[3]) {
   double R[9];
   ceres::AngleAxisToRotationMatrix(aa, R);
   Eigen::Matrix3d M;
-  M << R[0], R[1], R[2],
-       R[3], R[4], R[5],
-       R[6], R[7], R[8];
+  M << R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8];
   return M;
 }
 
@@ -167,6 +163,21 @@ void BundleAdjuster::Adjust(const io::ImageDataset& dataset, sfm::Reconstruction
     problem.SetParameterBlockConstant(pose_params[idx].data());
   }
 
+  // Pre-cache principal points per camera to avoid repeated dataset lookups
+  std::vector<std::pair<double, double>> principal_points(M);
+  for (int ci = 0; ci < M; ++ci) {
+    const ImageId id = cam_ids[ci];
+    const auto& img = dataset.image(id);
+    principal_points[ci] = {img.intr.cx_px, img.intr.cy_px};
+  }
+
+  // Share a single HuberLoss instance across all residuals
+  // Ceres doesn't take ownership when the same loss is used multiple times
+  ceres::LossFunction* shared_loss = nullptr;
+  if (opt_.huber_loss_px > 0.0) {
+    shared_loss = new ceres::HuberLoss(opt_.huber_loss_px);
+  }
+
   int residuals_added = 0;
   for (const int tid : track_ids) {
     const Track& t = rec->tracks.all()[tid];
@@ -177,27 +188,29 @@ void BundleAdjuster::Adjust(const io::ImageDataset& dataset, sfm::Reconstruction
       if (it == cam_to_idx.end()) continue;
 
       const int ci = it->second;
-      const double cx = dataset.image(obs.image_id).intr.cx_px;
-      const double cy = dataset.image(obs.image_id).intr.cy_px;
+      const auto& [cx, cy] = principal_points[ci];  // Use cached values
 
       ceres::CostFunction* cost = ReprojectionResidual::Create(obs.u_px, obs.v_px, cx, cy);
-      ceres::LossFunction* loss = nullptr;
-      if (opt_.huber_loss_px > 0.0) {
-        loss = new ceres::HuberLoss(opt_.huber_loss_px);
-      }
 
-      problem.AddResidualBlock(cost, loss, pose_params[ci].data(), intr_params[ci].data(), points[pidx].data());
+      problem.AddResidualBlock(cost, shared_loss, pose_params[ci].data(), intr_params[ci].data(),
+                               points[pidx].data());
       residuals_added++;
     }
   }
 
-  if (residuals_added == 0) return;
+  if (residuals_added == 0) {
+    delete shared_loss;  // Clean up if no residuals were added
+    return;
+  }
 
   ceres::Solver::Options options;
   options.max_num_iterations = opt_.max_iterations;
   options.linear_solver_type = ceres::SPARSE_SCHUR;
   options.minimizer_progress_to_stdout = false;
-  options.num_threads = 4;
+
+  // Use all available hardware threads instead of hardcoded 4
+  options.num_threads = static_cast<int>(std::thread::hardware_concurrency());
+  if (options.num_threads <= 0) options.num_threads = 4;  // Fallback
 
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);

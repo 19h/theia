@@ -13,6 +13,34 @@ find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc features2d calib3
 find_package(Eigen3 REQUIRED)
 find_package(Ceres REQUIRED)
 
+# OpenMP support for parallel processing
+# On macOS with Apple Clang, need to help CMake find Homebrew's libomp
+if(APPLE)
+    # Check for Homebrew libomp
+    execute_process(
+        COMMAND brew --prefix libomp
+        OUTPUT_VARIABLE HOMEBREW_LIBOMP_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE HOMEBREW_LIBOMP_RESULT
+    )
+    if(HOMEBREW_LIBOMP_RESULT EQUAL 0 AND EXISTS "${HOMEBREW_LIBOMP_PREFIX}")
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${HOMEBREW_LIBOMP_PREFIX}/include" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${HOMEBREW_LIBOMP_PREFIX}/include" CACHE STRING "" FORCE)
+        set(OpenMP_C_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_omp_LIBRARY "${HOMEBREW_LIBOMP_PREFIX}/lib/libomp.dylib" CACHE FILEPATH "" FORCE)
+        message(STATUS "Found Homebrew libomp at: ${HOMEBREW_LIBOMP_PREFIX}")
+    endif()
+endif()
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found - enabling parallel processing")
+else()
+    message(WARNING "OpenMP not found - parallel processing disabled")
+endif()
+
 add_library(psynth
   src/config.cpp
   src/io/dataset.cpp
@@ -40,7 +68,13 @@ target_link_libraries(psynth
     Eigen3::Eigen
     ${OpenCV_LIBS}
     Ceres::ceres
+    $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
+
+# Define PSYNTH_USE_OPENMP if OpenMP is available
+if(OpenMP_CXX_FOUND)
+    target_compile_definitions(psynth PUBLIC PSYNTH_USE_OPENMP)
+endif()
 
 target_compile_features(psynth PUBLIC cxx_std_17)
 

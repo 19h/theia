@@ -2,6 +2,7 @@
 
 BUILD_DIR := build
 BUILD_TYPE ?= Release
+CMAKE_GENERATOR ?= Ninja
 CMAKE_FLAGS ?=
 JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
@@ -16,7 +17,7 @@ all: build
 
 # Configure CMake
 configure:
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake -B $(BUILD_DIR) -G $(CMAKE_GENERATOR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
 
 # Build everything
 build: configure
@@ -94,6 +95,7 @@ help:
 	@echo ""
 	@echo "Options:"
 	@echo "  BUILD_TYPE=Debug|Release  Set build type (default: Release)"
+	@echo "  CMAKE_GENERATOR=...       CMake generator (default: Ninja)"
 	@echo "  JOBS=N                    Parallel jobs (default: auto)"
 	@echo "  CMAKE_FLAGS=\"...\"         Additional CMake flags"
 	@echo "  ARGS=\"...\"                Arguments for run-pipeline"

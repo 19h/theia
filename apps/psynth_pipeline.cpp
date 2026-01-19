@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <iostream>
 #include <psynth/common.hpp>
 #include <psynth/config.hpp>
 #include <psynth/features/sift.hpp>
@@ -10,11 +12,12 @@
 #include <psynth/sfm/incremental_sfm.hpp>
 #include <psynth/sfm/tracks.hpp>
 #include <psynth/types.hpp>
-
-#include <filesystem>
-#include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef PSYNTH_USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -73,10 +76,12 @@ int main(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
 
-    psynth::PipelineConfig cfg =
-        args.config_path.empty() ? psynth::PipelineConfig() : psynth::PipelineConfig::FromYAML(args.config_path);
+    psynth::PipelineConfig cfg = args.config_path.empty()
+                                     ? psynth::PipelineConfig()
+                                     : psynth::PipelineConfig::FromYAML(args.config_path);
 
-    psynth::io::ImageDataset dataset = psynth::io::ImageDataset::FromDirectory(args.images_dir, cfg);
+    psynth::io::ImageDataset dataset =
+        psynth::io::ImageDataset::FromDirectory(args.images_dir, cfg);
 
     const fs::path out_dir(args.out_dir);
     psynth::io::EnsureDir(out_dir);
@@ -98,13 +103,23 @@ int main(int argc, char** argv) {
       features.resize(dataset.size());
       psynth::io::EnsureDir(features_dir);
 
-      for (int i = 0; i < dataset.size(); ++i) {
+      const int num_images = dataset.size();
+
+#ifdef PSYNTH_USE_OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int i = 0; i < num_images; ++i) {
         cv::Mat gray = dataset.ReadGray(i);
         features[i] = psynth::features::ExtractSIFT(gray, cfg.sift);
-        std::cerr << "[psynth] features image " << i << " keypoints=" << features[i].keypoints.size() << "\n";
+#ifdef PSYNTH_USE_OPENMP
+#pragma omp critical
+#endif
+        std::cerr << "[psynth] features image " << i
+                  << " keypoints=" << features[i].keypoints.size() << "\n";
       }
 
-      PSYNTH_REQUIRE(psynth::io::SaveAllFeatures(features_dir, features), "Failed to save features");
+      PSYNTH_REQUIRE(psynth::io::SaveAllFeatures(features_dir, features),
+                     "Failed to save features");
     } else {
       std::cerr << "[psynth] loaded cached features from " << features_dir.string() << "\n";
     }
@@ -123,9 +138,40 @@ int main(int argc, char** argv) {
     if (!have_verified) {
       const int N = dataset.size();
 
+      // Build FLANN indices for all images (O(N) instead of O(N^2) index builds)
+      std::cerr << "[psynth] building FLANN indices for " << N << " images...\n";
+      psynth::matching::FeatureMatcher matcher(features, cfg.matcher);
+      matcher.BuildIndices();
+      std::cerr << "[psynth] FLANN indices built\n";
+
+      // Generate all pairs for parallel processing
+      std::vector<std::pair<int, int>> pairs;
+      pairs.reserve(N * (N - 1) / 2);
       for (int i = 0; i < N; ++i) {
         for (int j = i + 1; j < N; ++j) {
-          const auto matches = psynth::matching::MatchSiftSymmetric(features[i], features[j], cfg.matcher);
+          pairs.emplace_back(i, j);
+        }
+      }
+
+      const int num_pairs = static_cast<int>(pairs.size());
+
+#ifdef PSYNTH_USE_OPENMP
+      // Thread-local storage for results to avoid lock contention
+      const int max_threads = omp_get_max_threads();
+      std::vector<std::vector<psynth::VerifiedPair>> local_results(max_threads);
+
+#pragma omp parallel
+      {
+        const int tid = omp_get_thread_num();
+        local_results[tid].reserve(num_pairs / max_threads + 1);
+
+#pragma omp for schedule(dynamic, 4)
+        for (int pi = 0; pi < num_pairs; ++pi) {
+          const int i = pairs[pi].first;
+          const int j = pairs[pi].second;
+
+          // Use cached FLANN indices - no index rebuild per pair!
+          const auto matches = matcher.Match(i, j);
           if (static_cast<int>(matches.size()) < cfg.matcher.min_matches) continue;
 
           std::vector<Eigen::Vector2d> x1;
@@ -145,7 +191,8 @@ int main(int argc, char** argv) {
           opt.confidence = cfg.fund_ransac.confidence;
           opt.inlier_threshold_px = cfg.fund_ransac.inlier_threshold_px;
           opt.min_inliers = cfg.fund_ransac.min_inliers;
-          opt.rng_seed = static_cast<uint32_t>(i * 73856093u) ^ static_cast<uint32_t>(j * 19349663u);
+          opt.rng_seed =
+              static_cast<uint32_t>(i * 73856093u) ^ static_cast<uint32_t>(j * 19349663u);
 
           const auto r = psynth::geometry::EstimateFundamentalRansac(x1, x2, opt);
           if (!r.success) continue;
@@ -160,14 +207,71 @@ int main(int argc, char** argv) {
           vp.inliers.reserve(r.inlier_indices.size());
           for (const int idx_inlier : r.inlier_indices) vp.inliers.push_back(matches[idx_inlier]);
 
-          verified_pairs.push_back(std::move(vp));
+          local_results[tid].push_back(std::move(vp));
 
-          std::cerr << "[psynth] verified pair (" << i << "," << j << ") inliers=" << r.inlier_indices.size()
-                    << " / " << matches.size() << "\n";
+#pragma omp critical
+          std::cerr << "[psynth] verified pair (" << i << "," << j
+                    << ") inliers=" << r.inlier_indices.size() << " / " << matches.size() << "\n";
         }
       }
 
-      PSYNTH_REQUIRE(psynth::io::SaveVerifiedPairs(verified_path, verified_pairs), "Failed to save verified_pairs");
+      // Merge thread-local results
+      for (const auto& local : local_results) {
+        for (const auto& vp : local) {
+          verified_pairs.push_back(vp);
+        }
+      }
+#else
+      // Sequential fallback when OpenMP is not available
+      for (int pi = 0; pi < num_pairs; ++pi) {
+        const int i = pairs[pi].first;
+        const int j = pairs[pi].second;
+
+        // Use cached FLANN indices - no index rebuild per pair!
+        const auto matches = matcher.Match(i, j);
+        if (static_cast<int>(matches.size()) < cfg.matcher.min_matches) continue;
+
+        std::vector<Eigen::Vector2d> x1;
+        std::vector<Eigen::Vector2d> x2;
+        x1.reserve(matches.size());
+        x2.reserve(matches.size());
+
+        for (const auto& m : matches) {
+          const auto& kp1 = features[i].keypoints[m.kp1];
+          const auto& kp2 = features[j].keypoints[m.kp2];
+          x1.emplace_back(kp1.pt.x, kp1.pt.y);
+          x2.emplace_back(kp2.pt.x, kp2.pt.y);
+        }
+
+        psynth::geometry::FundamentalRansacOptions opt;
+        opt.max_iterations = cfg.fund_ransac.max_iterations;
+        opt.confidence = cfg.fund_ransac.confidence;
+        opt.inlier_threshold_px = cfg.fund_ransac.inlier_threshold_px;
+        opt.min_inliers = cfg.fund_ransac.min_inliers;
+        opt.rng_seed = static_cast<uint32_t>(i * 73856093u) ^ static_cast<uint32_t>(j * 19349663u);
+
+        const auto r = psynth::geometry::EstimateFundamentalRansac(x1, x2, opt);
+        if (!r.success) continue;
+
+        psynth::VerifiedPair vp;
+        vp.pair.i = i;
+        vp.pair.j = j;
+        vp.F = r.F;
+        vp.num_ransac_iters = r.iterations_run;
+        vp.inlier_threshold_px = r.inlier_threshold_px;
+
+        vp.inliers.reserve(r.inlier_indices.size());
+        for (const int idx_inlier : r.inlier_indices) vp.inliers.push_back(matches[idx_inlier]);
+
+        verified_pairs.push_back(std::move(vp));
+
+        std::cerr << "[psynth] verified pair (" << i << "," << j
+                  << ") inliers=" << r.inlier_indices.size() << " / " << matches.size() << "\n";
+      }
+#endif
+
+      PSYNTH_REQUIRE(psynth::io::SaveVerifiedPairs(verified_path, verified_pairs),
+                     "Failed to save verified_pairs");
     } else {
       std::cerr << "[psynth] loaded cached verified pairs from " << verified_path.string() << "\n";
     }
@@ -175,7 +279,8 @@ int main(int argc, char** argv) {
     // =========================
     // Track building
     // =========================
-    psynth::sfm::Tracks tracks = psynth::sfm::BuildTracksUnionFind(features, dataset.size(), verified_pairs);
+    psynth::sfm::Tracks tracks =
+        psynth::sfm::BuildTracksUnionFind(features, dataset.size(), verified_pairs);
     std::cerr << "[psynth] tracks built: " << tracks.all().size() << "\n";
 
     // =========================
@@ -184,19 +289,23 @@ int main(int argc, char** argv) {
     psynth::sfm::IncrementalSfM sfm(dataset, features, verified_pairs, std::move(tracks), cfg);
     psynth::sfm::Reconstruction rec = sfm.Run();
 
-    std::cerr << "[psynth] reconstruction: cameras=" << rec.cameras.size() << " tracks=" << rec.tracks.all().size()
-              << "\n";
+    std::cerr << "[psynth] reconstruction: cameras=" << rec.cameras.size()
+              << " tracks=" << rec.tracks.all().size() << "\n";
 
     // =========================
     // Export
     // =========================
-    PSYNTH_REQUIRE(psynth::io::ExportSparsePLY((out_dir / "sparse.ply").string(), rec), "Failed to write sparse.ply");
-    PSYNTH_REQUIRE(psynth::io::ExportCamerasPLY((out_dir / "cameras.ply").string(), rec), "Failed to write cameras.ply");
-    PSYNTH_REQUIRE(psynth::io::ExportBundleOut((out_dir / "bundle.out").string(), dataset, rec), "Failed to write bundle.out");
+    PSYNTH_REQUIRE(psynth::io::ExportSparsePLY((out_dir / "sparse.ply").string(), rec),
+                   "Failed to write sparse.ply");
+    PSYNTH_REQUIRE(psynth::io::ExportCamerasPLY((out_dir / "cameras.ply").string(), rec),
+                   "Failed to write cameras.ply");
+    PSYNTH_REQUIRE(psynth::io::ExportBundleOut((out_dir / "bundle.out").string(), dataset, rec),
+                   "Failed to write bundle.out");
 
     if (cfg.pmvs.enabled) {
       const fs::path pmvs_root = out_dir / cfg.pmvs.pmvs_root;
-      PSYNTH_REQUIRE(psynth::mvs::ExportPMVS(pmvs_root.string(), dataset, rec, cfg), "PMVS export failed");
+      PSYNTH_REQUIRE(psynth::mvs::ExportPMVS(pmvs_root.string(), dataset, rec, cfg),
+                     "PMVS export failed");
       std::cerr << "[psynth] PMVS input exported to: " << pmvs_root.string() << "\n";
     }
 
