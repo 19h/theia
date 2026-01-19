@@ -45,4 +45,14 @@ void BatchProjectPoints(const Camera& cam,
                         int num_points,
                         double* proj_uv);
 
+// Compute reprojection errors for a single 3D point observed by multiple cameras
+// This is the hot path in outlier filtering where one track is checked against all its observations
+// Input: X_world - single 3D point, cameras - array of camera pointers, obs_uv - observation coords
+// Output: errors_out - reprojection error per camera (size = num_cameras)
+void SinglePointMultiCameraErrors(const Eigen::Vector3d& X_world,
+                                  const Camera* const* cameras,  // Array of pointers
+                                  const double* obs_uv,          // u0,v0,u1,v1,...
+                                  int num_cameras,
+                                  double* errors_out);
+
 }  // namespace psynth::geometry

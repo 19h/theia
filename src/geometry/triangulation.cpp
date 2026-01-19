@@ -357,4 +357,53 @@ void BatchReprojectionErrorPx(const Camera& cam,
 #endif
 }
 
+void SinglePointMultiCameraErrors(const Eigen::Vector3d& X_world,
+                                  const Camera* const* cameras,
+                                  const double* obs_uv,
+                                  int num_cameras,
+                                  double* errors_out) {
+  if (num_cameras <= 0) return;
+
+  const double Xw = X_world.x();
+  const double Yw = X_world.y();
+  const double Zw = X_world.z();
+
+  for (int ci = 0; ci < num_cameras; ++ci) {
+    const Camera& cam = *cameras[ci];
+
+    // Extract camera params
+    const double r00 = cam.pose.R(0, 0), r01 = cam.pose.R(0, 1), r02 = cam.pose.R(0, 2);
+    const double r10 = cam.pose.R(1, 0), r11 = cam.pose.R(1, 1), r12 = cam.pose.R(1, 2);
+    const double r20 = cam.pose.R(2, 0), r21 = cam.pose.R(2, 1), r22 = cam.pose.R(2, 2);
+    const double tx = cam.pose.t.x(), ty = cam.pose.t.y(), tz = cam.pose.t.z();
+
+    // Transform to camera coords
+    const double Xc = r00 * Xw + r01 * Yw + r02 * Zw + tx;
+    const double Yc = r10 * Xw + r11 * Yw + r12 * Zw + ty;
+    const double Zc = r20 * Xw + r21 * Yw + r22 * Zw + tz;
+
+    if (Zc <= std::numeric_limits<double>::epsilon()) {
+      errors_out[ci] = std::numeric_limits<double>::max();
+      continue;
+    }
+
+    const double inv_z = 1.0 / Zc;
+    const double x = Xc * inv_z;
+    const double y = Yc * inv_z;
+
+    // Distortion
+    const double r2 = x * x + y * y;
+    const double d = 1.0 + cam.intr.k1 * r2 + cam.intr.k2 * r2 * r2;
+
+    // Project
+    const double u_proj = cam.intr.f_px * d * x + cam.intr.cx_px;
+    const double v_proj = cam.intr.f_px * d * y + cam.intr.cy_px;
+
+    // Error
+    const double du = u_proj - obs_uv[ci * 2];
+    const double dv = v_proj - obs_uv[ci * 2 + 1];
+    errors_out[ci] = std::sqrt(du * du + dv * dv);
+  }
+}
+
 }  // namespace psynth::geometry

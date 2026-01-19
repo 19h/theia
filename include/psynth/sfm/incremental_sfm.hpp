@@ -31,9 +31,16 @@ class IncrementalSfM {
 
   void InitializeFromPair(ImageId i, ImageId j, const VerifiedPair& vp, Reconstruction* rec);
 
-  ImageId SelectNextImage(const Reconstruction& rec, const std::vector<bool>& registered) const;
+  ImageId SelectNextImage(const Reconstruction& rec, const std::vector<bool>& registered,
+                          const std::vector<bool>& tried) const;
 
   bool RegisterImage(ImageId img, Reconstruction* rec);
+
+  // Try to register an unregistered image using a verified pair with a registered camera
+  // Returns the registered image ID or -1 if none could be registered
+  ImageId TryRegisterViaVerifiedPair(const std::vector<bool>& registered,
+                                      const std::vector<bool>& tried,
+                                      Reconstruction* rec);
 
   void TriangulateNewTracks(Reconstruction* rec);
 

@@ -56,19 +56,60 @@ Reconstruction IncrementalSfM::Run() {
 
   const int N = dataset_.size();
   std::vector<bool> registered(N, false);
+  std::vector<bool> tried(N, false);  // Track images we've attempted to register
   for (const auto& kv : rec.cameras) {
-    if (kv.first >= 0 && kv.first < N) registered[kv.first] = true;
+    if (kv.first >= 0 && kv.first < N) {
+      registered[kv.first] = true;
+      tried[kv.first] = true;
+    }
   }
 
   while (true) {
-    const ImageId next = SelectNextImage(rec, registered);
-    if (next < 0) break;
+    ImageId next = SelectNextImage(rec, registered, tried);
 
+    // If no image can be registered via normal PnP, try via verified pair
+    if (next < 0) {
+      next = TryRegisterViaVerifiedPair(registered, tried, &rec);
+      if (next >= 0) {
+        registered[next] = true;
+        tried[next] = true;
+        // Triangulate new tracks after relative pose registration
+        TriangulateNewTracks(&rec);
+        // Continue to next iteration to try more registrations
+        continue;
+      }
+      break;  // No more images can be registered
+    }
+
+    tried[next] = true;  // Mark as tried BEFORE attempting registration
     const bool ok = RegisterImage(next, &rec);
-    registered[next] = ok;
-    if (!ok) continue;
+    if (!ok) {
+      std::cerr << "[psynth] failed to register image " << next << "\n";
+      continue;
+    }
+    registered[next] = true;
+
+    // Count triangulated tracks before
+    size_t tracks_before = 0;
+    for (const auto& t : rec.tracks.all()) {
+      if (t.triangulated) tracks_before++;
+    }
 
     TriangulateNewTracks(&rec);
+
+    // Count triangulated tracks after
+    size_t tracks_after = 0;
+    for (const auto& t : rec.tracks.all()) {
+      if (t.triangulated) tracks_after++;
+    }
+
+    // Reset tried list if we triangulated new points - failed images might now have enough correspondences
+    if (tracks_after > tracks_before) {
+      std::fill(tried.begin(), tried.end(), false);
+      for (ImageId img = 0; img < N; ++img) {
+        if (registered[img]) tried[img] = true;
+      }
+    }
 
     if (cfg_.sfm.bundle_every_n_images > 0 &&
         static_cast<int>(rec.cameras.size()) % cfg_.sfm.bundle_every_n_images == 0) {
@@ -486,13 +527,24 @@ void IncrementalSfM::InitializeFromPair(ImageId i, ImageId j, const VerifiedPair
 }
 
 ImageId IncrementalSfM::SelectNextImage(const Reconstruction& rec,
-                                        const std::vector<bool>& registered) const {
+                                        const std::vector<bool>& registered,
+                                        const std::vector<bool>& tried) const {
   const int N = dataset_.size();
   ImageId best = -1;
   int best_count = -1;
 
+  // For debugging: track why images are skipped
+  int num_registered = 0, num_tried = 0, num_below_threshold = 0;
+
   for (ImageId img = 0; img < N; ++img) {
-    if (registered[img]) continue;
+    if (registered[img]) {
+      num_registered++;
+      continue;
+    }
+    if (tried[img]) {
+      num_tried++;
+      continue;
+    }
 
     int count = 0;
     for (const int tid : rec.tracks.tracks_in_image(img)) {
@@ -501,13 +553,23 @@ ImageId IncrementalSfM::SelectNextImage(const Reconstruction& rec,
       count++;
     }
 
+    if (count < cfg_.sfm.min_pnp_correspondences) {
+      num_below_threshold++;
+    }
+
     if (count > best_count) {
       best_count = count;
       best = img;
     }
   }
 
-  if (best_count < cfg_.sfm.min_pnp_correspondences) return -1;
+  if (best_count < cfg_.sfm.min_pnp_correspondences) {
+    std::cerr << "[psynth] SelectNextImage: no candidate (registered=" << num_registered
+              << " tried=" << num_tried << " below_threshold=" << num_below_threshold
+              << " best_count=" << best_count
+              << " min_correspondences=" << cfg_.sfm.min_pnp_correspondences << ")\n";
+    return -1;
+  }
   return best;
 }
 
@@ -725,6 +787,8 @@ void IncrementalSfM::FilterTrackOutliers(Reconstruction* rec) {
   std::atomic<int> removed_obs{0};
   std::atomic<int> disabled_tracks{0};
 
+  const double max_err = cfg_.sfm.max_reprojection_error_px;
+
 #ifdef PSYNTH_USE_OPENMP
 #pragma omp parallel for schedule(dynamic, 32)
 #endif
@@ -732,29 +796,72 @@ void IncrementalSfM::FilterTrackOutliers(Reconstruction* rec) {
     auto& track = all_tracks[ti];
     if (!track.triangulated) continue;
 
+    const int num_obs = static_cast<int>(track.observations.size());
+    if (num_obs == 0) continue;
+
+    // Thread-local buffers for batch computation
+    thread_local std::vector<const Camera*> cam_ptrs;
+    thread_local std::vector<double> obs_uv;
+    thread_local std::vector<double> errors;
+    thread_local std::vector<int> obs_indices;  // Maps batch index to original obs index
+
+    cam_ptrs.clear();
+    obs_uv.clear();
+    obs_indices.clear();
+    cam_ptrs.reserve(num_obs);
+    obs_uv.reserve(num_obs * 2);
+    obs_indices.reserve(num_obs);
+
+    // Collect observations that have registered cameras
+    for (int oi = 0; oi < num_obs; ++oi) {
+      const auto& obs = track.observations[oi];
+      const auto it_cam = rec->cameras.find(obs.image_id);
+      if (it_cam != rec->cameras.end()) {
+        cam_ptrs.push_back(&it_cam->second);
+        obs_uv.push_back(obs.u_px);
+        obs_uv.push_back(obs.v_px);
+        obs_indices.push_back(oi);
+      }
+    }
+
+    const int num_to_check = static_cast<int>(cam_ptrs.size());
+
+    // Batch compute reprojection errors
+    errors.resize(num_to_check);
+    if (num_to_check > 0) {
+      geometry::SinglePointMultiCameraErrors(track.xyz, cam_ptrs.data(), obs_uv.data(),
+                                             num_to_check, errors.data());
+    }
+
+    // Build kept observations
     std::vector<Observation> kept;
-    kept.reserve(track.observations.size());
+    kept.reserve(num_obs);
 
     int local_removed = 0;
-    for (const auto& obs : track.observations) {
-      const auto it_cam = rec->cameras.find(obs.image_id);
-      if (it_cam == rec->cameras.end()) {
-        kept.push_back(obs);
-        continue;
-      }
+    int batch_idx = 0;
 
-      const Eigen::Vector2d uv(obs.u_px, obs.v_px);
-      const double e = geometry::ReprojectionErrorPx(it_cam->second, track.xyz, uv);
-      if (e <= cfg_.sfm.max_reprojection_error_px) {
+    for (int oi = 0; oi < num_obs; ++oi) {
+      const auto& obs = track.observations[oi];
+      const auto it_cam = rec->cameras.find(obs.image_id);
+
+      if (it_cam == rec->cameras.end()) {
+        // Unregistered camera - keep observation
         kept.push_back(obs);
       } else {
-        local_removed++;
+        // Check error from batch computation
+        if (errors[batch_idx] <= max_err) {
+          kept.push_back(obs);
+        } else {
+          local_removed++;
+        }
+        batch_idx++;
       }
     }
 
     track.observations = std::move(kept);
     removed_obs.fetch_add(local_removed, std::memory_order_relaxed);
 
+    // Count remaining registered observations
     int reg_after = 0;
     for (const auto& obs : track.observations) {
       if (rec->cameras.find(obs.image_id) != rec->cameras.end()) reg_after++;
@@ -773,6 +880,316 @@ void IncrementalSfM::FilterTrackOutliers(Reconstruction* rec) {
     std::cerr << "[psynth] outlier filter: removed_obs=" << total_removed
               << " disabled_tracks=" << total_disabled << "\n";
   }
+}
+
+ImageId IncrementalSfM::TryRegisterViaVerifiedPair(const std::vector<bool>& registered,
+                                                    const std::vector<bool>& tried,
+                                                    Reconstruction* rec) {
+  PSYNTH_REQUIRE(rec, "TryRegisterViaVerifiedPair: rec is null");
+
+  // Find the best verified pair where one image is registered and one is not
+  int best_pair_idx = -1;
+  int best_inliers = -1;
+  ImageId best_registered = -1;
+  ImageId best_unregistered = -1;
+
+  for (int pi = 0; pi < static_cast<int>(verified_pairs_.size()); ++pi) {
+    const auto& vp = verified_pairs_[pi];
+    const ImageId i = vp.pair.i;
+    const ImageId j = vp.pair.j;
+
+    const bool i_reg = (i >= 0 && i < static_cast<int>(registered.size()) && registered[i]);
+    const bool j_reg = (j >= 0 && j < static_cast<int>(registered.size()) && registered[j]);
+    const bool i_tried = (i >= 0 && i < static_cast<int>(tried.size()) && tried[i]);
+    const bool j_tried = (j >= 0 && j < static_cast<int>(tried.size()) && tried[j]);
+
+    // We need exactly one registered and one unregistered (and not tried)
+    if (i_reg && !j_reg && !j_tried) {
+      const int n_inliers = static_cast<int>(vp.inliers.size());
+      if (n_inliers > best_inliers) {
+        best_inliers = n_inliers;
+        best_pair_idx = pi;
+        best_registered = i;
+        best_unregistered = j;
+      }
+    } else if (j_reg && !i_reg && !i_tried) {
+      const int n_inliers = static_cast<int>(vp.inliers.size());
+      if (n_inliers > best_inliers) {
+        best_inliers = n_inliers;
+        best_pair_idx = pi;
+        best_registered = j;
+        best_unregistered = i;
+      }
+    }
+  }
+
+  if (best_pair_idx < 0) {
+    std::cerr << "[psynth] TryRegisterViaVerifiedPair: no suitable pair found\n";
+    return -1;
+  }
+
+  const auto& vp = verified_pairs_[best_pair_idx];
+  std::cerr << "[psynth] TryRegisterViaVerifiedPair: attempting (" << best_registered << ", "
+            << best_unregistered << ") with " << best_inliers << " inliers\n";
+
+  // Get the registered camera - use its optimized intrinsics
+  const auto& cam_reg = rec->cameras.at(best_registered);
+  const Intrinsics& intr_reg = cam_reg.intr;  // Use optimized intrinsics from reconstruction
+  const Intrinsics& intr_unreg = dataset_.image(best_unregistered).intr;
+
+  // Build pixel coordinates from inliers
+  std::vector<Eigen::Vector2d> x_reg_px, x_unreg_px;
+  x_reg_px.reserve(vp.inliers.size());
+  x_unreg_px.reserve(vp.inliers.size());
+
+  for (const auto& m : vp.inliers) {
+    const auto& k1 = features_[vp.pair.i].keypoints[m.kp1];
+    const auto& k2 = features_[vp.pair.j].keypoints[m.kp2];
+    if (vp.pair.i == best_registered) {
+      x_reg_px.emplace_back(k1.pt.x, k1.pt.y);
+      x_unreg_px.emplace_back(k2.pt.x, k2.pt.y);
+    } else {
+      x_reg_px.emplace_back(k2.pt.x, k2.pt.y);
+      x_unreg_px.emplace_back(k1.pt.x, k1.pt.y);
+    }
+  }
+
+  // Compute essential matrix and relative pose
+  // Important: F is computed for pair (i, j) with convention x_j^T * F * x_i = 0
+  // If we swap the image order (registered != i), we need to transpose F
+  const Eigen::Matrix3d F_ordered =
+      (vp.pair.i == best_registered) ? vp.F : vp.F.transpose();
+  const Eigen::Matrix3d E =
+      geometry::EssentialFromFundamental(F_ordered, intr_reg, intr_unreg);
+  const auto cheirality = geometry::ChooseRelativePoseCheirality(E, intr_reg, intr_unreg, x_reg_px, x_unreg_px);
+  if (cheirality.num_positive_depth <= 0) {
+    std::cerr << "[psynth] TryRegisterViaVerifiedPair: cheirality test failed\n";
+    return -1;
+  }
+
+  geometry::RelativePose rel = cheirality.pose;
+  const double tnorm = rel.t.norm();
+  if (tnorm <= std::numeric_limits<double>::epsilon()) {
+    std::cerr << "[psynth] TryRegisterViaVerifiedPair: degenerate translation\n";
+    return -1;
+  }
+
+  // The relative pose is: x_unreg_cam = rel.R * x_reg_cam + rel.t
+  // We need to compose this with the registered camera's pose to get world-to-camera for unreg
+
+  // Registered camera: X_reg_cam = R_reg * X_world + t_reg
+  // Relative: X_unreg_cam = R_rel * X_reg_cam + t_rel (after normalization)
+  // Combined: X_unreg_cam = R_rel * (R_reg * X_world + t_reg) + t_rel
+  //                       = (R_rel * R_reg) * X_world + (R_rel * t_reg + t_rel)
+
+  // The relative translation is unit length - we need to find the scale by matching
+  // against existing triangulated 3D points visible in the registered camera
+
+  // Build index: (image_id, kp_idx) -> (track_id, 3D point) for triangulated tracks
+  std::unordered_map<uint64_t, std::pair<int, Eigen::Vector3d>> kp_to_track;
+  const auto& all_tracks = rec->tracks.all();
+  for (int ti = 0; ti < static_cast<int>(all_tracks.size()); ++ti) {
+    const auto& track = all_tracks[ti];
+    if (!track.triangulated) continue;
+    for (const auto& obs : track.observations) {
+      if (obs.image_id == best_registered) {
+        // Pack (image_id, kp_idx) into a 64-bit key
+        const uint64_t key =
+            (static_cast<uint64_t>(obs.image_id) << 32) | static_cast<uint64_t>(obs.keypoint_id);
+        kp_to_track[key] = {ti, track.xyz};
+      }
+    }
+  }
+
+  // Create a temporary projection matrix for relative pose (unit scale)
+  static const Eigen::Matrix<double, 3, 4> P_identity =
+      (Eigen::Matrix<double, 3, 4>() << 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0).finished();
+  Eigen::Matrix<double, 3, 4> P_unreg_rel;
+  P_unreg_rel.block<3, 3>(0, 0) = rel.R;
+  P_unreg_rel.col(3) = rel.t;
+
+  // Collect scale ratios by comparing triangulated points with existing 3D points
+  std::vector<double> scale_ratios;
+  scale_ratios.reserve(vp.inliers.size());
+
+  for (size_t k = 0; k < vp.inliers.size(); ++k) {
+    const auto& m = vp.inliers[k];
+    // Get keypoint index in registered image
+    const int kp_reg = (vp.pair.i == best_registered) ? m.kp1 : m.kp2;
+
+    // Check if this keypoint is part of a triangulated track
+    const uint64_t key =
+        (static_cast<uint64_t>(best_registered) << 32) | static_cast<uint64_t>(kp_reg);
+    auto it = kp_to_track.find(key);
+    if (it == kp_to_track.end()) continue;
+
+    const Eigen::Vector3d& X_world_existing = it->second.second;
+
+    // Triangulate this correspondence at unit scale
+    const Eigen::Vector2d n_reg =
+        geometry::PixelToUndistortedNormalized(intr_reg, x_reg_px[k]);
+    const Eigen::Vector2d n_unreg =
+        geometry::PixelToUndistortedNormalized(intr_unreg, x_unreg_px[k]);
+
+    Eigen::Vector3d X_reg_cam;
+    if (!geometry::TriangulateDLT(P_identity, P_unreg_rel, n_reg, n_unreg, &X_reg_cam)) continue;
+
+    const double z_reg = X_reg_cam.z();
+    const double z_unreg = (rel.R * X_reg_cam + rel.t).z();
+    if (z_reg <= 0.01 || z_unreg <= 0.01) continue;
+
+    // Transform triangulated point to world coordinates (at unit scale)
+    const Eigen::Vector3d X_world_unit =
+        cam_reg.pose.R.transpose() * X_reg_cam + CameraCenterWorld(cam_reg.pose);
+
+    // Compute scale ratio: distance from camera to existing point / distance to unit point
+    const Eigen::Vector3d C_reg = CameraCenterWorld(cam_reg.pose);
+    const double dist_existing = (X_world_existing - C_reg).norm();
+    const double dist_unit = (X_world_unit - C_reg).norm();
+
+    if (dist_unit > 0.001) {
+      scale_ratios.push_back(dist_existing / dist_unit);
+    }
+  }
+
+  double scale = 1.0;
+  if (scale_ratios.size() >= 5) {
+    // Use median scale ratio
+    std::nth_element(scale_ratios.begin(), scale_ratios.begin() + scale_ratios.size() / 2,
+                     scale_ratios.end());
+    scale = scale_ratios[scale_ratios.size() / 2];
+  } else {
+    // Fallback: estimate scale from average depth of existing 3D points visible from reg camera
+    double total_depth = 0.0;
+    int depth_count = 0;
+    for (const auto& track : all_tracks) {
+      if (!track.triangulated) continue;
+      for (const auto& obs : track.observations) {
+        if (obs.image_id == best_registered) {
+          const Eigen::Vector3d X_cam = cam_reg.pose.R * track.xyz + cam_reg.pose.t;
+          if (X_cam.z() > 0.1) {
+            total_depth += X_cam.z();
+            depth_count++;
+          }
+          break;
+        }
+      }
+    }
+
+    if (depth_count >= 10) {
+      // Estimate scale so triangulated points have similar depth
+      const double avg_existing_depth = total_depth / depth_count;
+
+      // Compute average depth of unit-scale triangulated points
+      double total_unit_depth = 0.0;
+      int unit_count = 0;
+      for (int k = 0; k < std::min(50, static_cast<int>(x_reg_px.size())); ++k) {
+        const Eigen::Vector2d n_reg =
+            geometry::PixelToUndistortedNormalized(intr_reg, x_reg_px[k]);
+        const Eigen::Vector2d n_unreg =
+            geometry::PixelToUndistortedNormalized(intr_unreg, x_unreg_px[k]);
+
+        Eigen::Vector3d X_reg_cam;
+        if (!geometry::TriangulateDLT(P_identity, P_unreg_rel, n_reg, n_unreg, &X_reg_cam))
+          continue;
+
+        if (X_reg_cam.z() > 0.01) {
+          total_unit_depth += X_reg_cam.z();
+          unit_count++;
+        }
+      }
+
+      if (unit_count >= 10) {
+        const double avg_unit_depth = total_unit_depth / unit_count;
+        scale = avg_existing_depth / avg_unit_depth;
+      }
+    }
+  }
+
+  if (scale <= 0.001 || scale > 1000.0) {
+    std::cerr << "[psynth] TryRegisterViaVerifiedPair: invalid scale " << scale << "\n";
+    return -1;
+  }
+
+  // Compose the world-to-camera transformation
+  Camera cam_unreg;
+  cam_unreg.intr = intr_unreg;
+  cam_unreg.pose.R = rel.R * cam_reg.pose.R;
+  cam_unreg.pose.t = rel.R * cam_reg.pose.t + rel.t * scale;
+
+  // Verify by checking reprojection error on existing 3D points and triangulated points
+  int good_reproj = 0;
+  int total_checked = 0;
+
+  // First check against existing 3D points
+  for (size_t k = 0; k < vp.inliers.size() && total_checked < 50; ++k) {
+    const auto& m = vp.inliers[k];
+    const int kp_reg = (vp.pair.i == best_registered) ? m.kp1 : m.kp2;
+
+    const uint64_t key =
+        (static_cast<uint64_t>(best_registered) << 32) | static_cast<uint64_t>(kp_reg);
+    auto it = kp_to_track.find(key);
+    if (it == kp_to_track.end()) continue;
+
+    const Eigen::Vector3d& X_world = it->second.second;
+    const double e_reg = geometry::ReprojectionErrorPx(cam_reg, X_world, x_reg_px[k]);
+    const double e_unreg = geometry::ReprojectionErrorPx(cam_unreg, X_world, x_unreg_px[k]);
+
+    total_checked++;
+    if (e_reg < cfg_.sfm.max_reprojection_error_px * 2 &&
+        e_unreg < cfg_.sfm.max_reprojection_error_px * 2) {
+      good_reproj++;
+    }
+  }
+
+  // If not enough existing 3D points, also check freshly triangulated points
+  if (total_checked < 30) {
+    Eigen::Matrix<double, 3, 4> P_unreg_rel_scaled;
+    P_unreg_rel_scaled.block<3, 3>(0, 0) = rel.R;
+    P_unreg_rel_scaled.col(3) = rel.t * scale;
+
+    for (int k = 0; k < static_cast<int>(x_reg_px.size()) && total_checked < 50; ++k) {
+      const Eigen::Vector2d n_reg =
+          geometry::PixelToUndistortedNormalized(intr_reg, x_reg_px[k]);
+      const Eigen::Vector2d n_unreg =
+          geometry::PixelToUndistortedNormalized(intr_unreg, x_unreg_px[k]);
+
+      Eigen::Vector3d X_reg_cam;
+      if (!geometry::TriangulateDLT(P_identity, P_unreg_rel_scaled, n_reg, n_unreg, &X_reg_cam))
+        continue;
+
+      const double z_reg = X_reg_cam.z();
+      const double z_unreg = (rel.R * X_reg_cam + rel.t * scale).z();
+      if (z_reg <= 0.01 || z_unreg <= 0.01) continue;
+
+      // Transform to world coordinates
+      const Eigen::Vector3d X_world =
+          cam_reg.pose.R.transpose() * X_reg_cam + CameraCenterWorld(cam_reg.pose);
+
+      const double e_reg = geometry::ReprojectionErrorPx(cam_reg, X_world, x_reg_px[k]);
+      const double e_unreg = geometry::ReprojectionErrorPx(cam_unreg, X_world, x_unreg_px[k]);
+
+      total_checked++;
+      if (e_reg < cfg_.sfm.max_reprojection_error_px * 2 &&
+          e_unreg < cfg_.sfm.max_reprojection_error_px * 2) {
+        good_reproj++;
+      }
+    }
+  }
+
+  const int min_good = std::max(5, total_checked / 3);
+  if (good_reproj < min_good) {
+    std::cerr << "[psynth] TryRegisterViaVerifiedPair: failed (" << good_reproj << "/"
+              << total_checked << " good, need " << min_good << ")\n";
+    return -1;
+  }
+
+  // Add the camera to reconstruction
+  rec->cameras[best_unregistered] = cam_unreg;
+  std::cerr << "[psynth] registered image " << best_unregistered << " via verified pair with "
+            << best_registered << "\n";
+
+  return best_unregistered;
 }
 
 }  // namespace psynth::sfm

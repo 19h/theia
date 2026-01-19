@@ -83,19 +83,25 @@ struct alignas(kCacheLineSize) Intrinsics {
   int _pad[2] = {0, 0};  // Pad to cache line boundary
 };
 
-struct Pose {
+// Pose aligned for Eigen compatibility (16-byte for SSE, but we use 32 for consistency)
+struct alignas(kSimdAlignment) Pose {
   // World-to-camera: X_cam = R * X_world + t
   Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
   Eigen::Vector3d t = Eigen::Vector3d::Zero();
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
 inline Eigen::Vector3d CameraCenterWorld(const Pose& pose) {
   return -pose.R.transpose() * pose.t;
 }
 
-struct Camera {
+// Camera struct - cache-line aligned for frequent access in hot loops
+struct alignas(kCacheLineSize) Camera {
   Intrinsics intr;
   Pose pose;
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
 struct ImageInfo {
@@ -128,20 +134,25 @@ struct VerifiedPair {
   double inlier_threshold_px = 0.0;
 };
 
-struct Observation {
-  ImageId image_id = -1;
-  int keypoint_id = -1;
+// Observation - aligned for SIMD-friendly memory access
+// Reordered: doubles first for natural alignment
+struct alignas(kSimdAlignment) Observation {
   double u_px = 0.0;
   double v_px = 0.0;
+  ImageId image_id = -1;
+  int keypoint_id = -1;
 };
 
-struct Track {
+// Track - cache-line aligned for hot loop access
+struct alignas(kCacheLineSize) Track {
+  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();  // Most accessed in reprojection - put first
   int id = -1;
+  bool triangulated = false;
+  cv::Vec3b color_bgr = cv::Vec3b(0, 0, 0);
+  char _pad[2] = {0, 0};  // Pad for alignment
   std::vector<Observation> observations;
 
-  bool triangulated = false;
-  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
-  cv::Vec3b color_bgr = cv::Vec3b(0, 0, 0);
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
 }  // namespace psynth
