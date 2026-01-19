@@ -174,7 +174,19 @@ int IncrementalSfM::SelectInitialPairIndex() const {
       P2.block<3, 3>(0, 0) = rel.R;
       P2.col(3) = rel.t;
 
+      // Build temporary cameras for reprojection check
+      Camera test_cam1;
+      test_cam1.intr = intr1;
+      test_cam1.pose.R = Eigen::Matrix3d::Identity();
+      test_cam1.pose.t = Eigen::Vector3d::Zero();
+
+      Camera test_cam2;
+      test_cam2.intr = intr2;
+      test_cam2.pose.R = rel.R;
+      test_cam2.pose.t = rel.t;
+
       const int max_test = std::min(static_cast<int>(vp.inliers.size()), 200);
+      int good_reproj = 0;
       for (int k = 0; k < max_test; ++k) {
         const Eigen::Vector2d n1 = geometry::PixelToUndistortedNormalized(intr1, x1_px[k]);
         const Eigen::Vector2d n2 = geometry::PixelToUndistortedNormalized(intr2, x2_px[k]);
@@ -186,15 +198,27 @@ int IncrementalSfM::SelectInitialPairIndex() const {
         const double z2 = (rel.R * X + rel.t).z();
         if (z1 <= 0 || z2 <= 0) continue;
 
+        // Check reprojection error - must be reasonable for both views
+        const double e1 = geometry::ReprojectionErrorPx(test_cam1, X, x1_px[k]);
+        const double e2 = geometry::ReprojectionErrorPx(test_cam2, X, x2_px[k]);
+        if (e1 > cfg_.sfm.max_reprojection_error_px || e2 > cfg_.sfm.max_reprojection_error_px) continue;
+
+        good_reproj++;
+
         const double ang_rad = geometry::TriangulationAngleRad(C1, C2, X);
         const double ang_deg = ang_rad * (180.0 / kPi);
         angles_deg.push_back(ang_deg);
       }
 
+      // Require at least 50% of tested points to have good reprojection
+      if (good_reproj < max_test / 2) continue;
+
       const double median_angle_deg = MedianInPlace(angles_deg);
       if (median_angle_deg < cfg_.sfm.init_min_median_triangulation_angle_deg) continue;
 
-      const double score = static_cast<double>(nF) * median_angle_deg;
+      // Score favors both inlier count and reprojection quality
+      const double score = static_cast<double>(good_reproj) * median_angle_deg;
+
       if (score > local_best_score[tid]) {
         local_best_score[tid] = score;
         local_best_idx[tid] = idx;
@@ -280,7 +304,19 @@ int IncrementalSfM::SelectInitialPairIndex() const {
     P2.block<3, 3>(0, 0) = rel.R;
     P2.col(3) = rel.t;
 
+    // Build temporary cameras for reprojection check
+    Camera test_cam1;
+    test_cam1.intr = intr1;
+    test_cam1.pose.R = Eigen::Matrix3d::Identity();
+    test_cam1.pose.t = Eigen::Vector3d::Zero();
+
+    Camera test_cam2;
+    test_cam2.intr = intr2;
+    test_cam2.pose.R = rel.R;
+    test_cam2.pose.t = rel.t;
+
     const int max_test = std::min(static_cast<int>(vp.inliers.size()), 200);
+    int good_reproj = 0;
     for (int k = 0; k < max_test; ++k) {
       const Eigen::Vector2d n1 = geometry::PixelToUndistortedNormalized(intr1, x1_px[k]);
       const Eigen::Vector2d n2 = geometry::PixelToUndistortedNormalized(intr2, x2_px[k]);
@@ -292,15 +328,27 @@ int IncrementalSfM::SelectInitialPairIndex() const {
       const double z2 = (rel.R * X + rel.t).z();
       if (z1 <= 0 || z2 <= 0) continue;
 
+      // Check reprojection error - must be reasonable for both views
+      const double e1 = geometry::ReprojectionErrorPx(test_cam1, X, x1_px[k]);
+      const double e2 = geometry::ReprojectionErrorPx(test_cam2, X, x2_px[k]);
+      if (e1 > cfg_.sfm.max_reprojection_error_px || e2 > cfg_.sfm.max_reprojection_error_px) continue;
+
+      good_reproj++;
+
       const double ang_rad = geometry::TriangulationAngleRad(C1, C2, X);
       const double ang_deg = ang_rad * (180.0 / kPi);
       angles_deg.push_back(ang_deg);
     }
 
+    // Require at least 50% of tested points to have good reprojection
+    if (good_reproj < max_test / 2) continue;
+
     const double median_angle_deg = MedianInPlace(angles_deg);
     if (median_angle_deg < cfg_.sfm.init_min_median_triangulation_angle_deg) continue;
 
-    const double score = static_cast<double>(nF) * median_angle_deg;
+    // Score favors both inlier count and reprojection quality
+    const double score = static_cast<double>(good_reproj) * median_angle_deg;
+
     if (score > best_score) {
       best_score = score;
       best_idx = idx;
@@ -385,14 +433,15 @@ void IncrementalSfM::InitializeFromPair(ImageId i, ImageId j, const VerifiedPair
   cv::Mat color_img = dataset_.ReadColor(i);
 
   int triangulated = 0;
+  int dbg_no_obs = 0, dbg_no_inlier = 0, dbg_tri_fail = 0, dbg_depth_fail = 0, dbg_reproj_fail = 0;
   for (auto& track : rec->tracks.all_mut()) {
     const Observation* oi = rec->tracks.FindObservation(track.id, i);
     const Observation* oj = rec->tracks.FindObservation(track.id, j);
-    if (!oi || !oj) continue;
+    if (!oi || !oj) { dbg_no_obs++; continue; }
 
     const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(oi->keypoint_id)) << 32) ^
                          static_cast<uint64_t>(static_cast<uint32_t>(oj->keypoint_id));
-    if (inlier_pair_set.find(key) == inlier_pair_set.end()) continue;
+    if (inlier_pair_set.find(key) == inlier_pair_set.end()) { dbg_no_inlier++; continue; }
 
     const Eigen::Vector2d n1 =
         geometry::PixelToUndistortedNormalized(intr1, Eigen::Vector2d(oi->u_px, oi->v_px));
@@ -400,18 +449,20 @@ void IncrementalSfM::InitializeFromPair(ImageId i, ImageId j, const VerifiedPair
         geometry::PixelToUndistortedNormalized(intr2, Eigen::Vector2d(oj->u_px, oj->v_px));
 
     Eigen::Vector3d X;
-    if (!geometry::TriangulateDLT(P1, P2, n1, n2, &X)) continue;
+    if (!geometry::TriangulateDLT(P1, P2, n1, n2, &X)) { dbg_tri_fail++; continue; }
 
     const double z1 = X.z();
     const double z2 = (rel.R * X + rel.t).z();
-    if (z1 <= 0 || z2 <= 0) continue;
+    if (z1 <= 0 || z2 <= 0) { dbg_depth_fail++; continue; }
 
     const double e1 =
         geometry::ReprojectionErrorPx(rec->cameras[i], X, Eigen::Vector2d(oi->u_px, oi->v_px));
     const double e2 =
         geometry::ReprojectionErrorPx(rec->cameras[j], X, Eigen::Vector2d(oj->u_px, oj->v_px));
-    if (e1 > cfg_.sfm.max_reprojection_error_px || e2 > cfg_.sfm.max_reprojection_error_px)
+    if (e1 > cfg_.sfm.max_reprojection_error_px || e2 > cfg_.sfm.max_reprojection_error_px) {
+      dbg_reproj_fail++;
       continue;
+    }
 
     track.triangulated = true;
     track.xyz = X;
@@ -429,7 +480,9 @@ void IncrementalSfM::InitializeFromPair(ImageId i, ImageId j, const VerifiedPair
 
   std::cerr << "[psynth] init pair (" << i << "," << j
             << ") cameras=2 tracks=" << rec->tracks.all().size() << " triangulated=" << triangulated
-            << "\n";
+            << " (no_obs=" << dbg_no_obs << " no_inlier=" << dbg_no_inlier
+            << " tri_fail=" << dbg_tri_fail << " depth_fail=" << dbg_depth_fail
+            << " reproj_fail=" << dbg_reproj_fail << ")\n";
 }
 
 ImageId IncrementalSfM::SelectNextImage(const Reconstruction& rec,

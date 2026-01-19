@@ -216,9 +216,17 @@ private:
 
             std::lock_guard<std::mutex> lock(reconstruction_mutex_);
             if (reconstruction_success_ && pending_reconstruction_) {
+                // Debug: count triangulated tracks
+                int triangulated_count = 0;
+                for (const auto& track : pending_reconstruction_->tracks.all()) {
+                    if (track.triangulated) triangulated_count++;
+                }
+                std::cerr << "[viewer] DEBUG: total tracks=" << pending_reconstruction_->tracks.all().size()
+                          << " triangulated=" << triangulated_count << std::endl;
+
                 renderer_.LoadReconstruction(*pending_reconstruction_, pending_images_);
                 ui_.SetStatusMessage("Reconstruction complete: " +
-                                     std::to_string(pending_reconstruction_->tracks.all().size()) + " points, " +
+                                     std::to_string(triangulated_count) + " points, " +
                                      std::to_string(pending_reconstruction_->cameras.size()) + " cameras");
                 pending_reconstruction_.reset();
                 pending_images_.clear();

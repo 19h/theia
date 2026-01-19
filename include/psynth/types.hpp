@@ -71,14 +71,16 @@ using AlignedVector = std::vector<T, AlignedAllocator<T>>;
 
 using ImageId = int;
 
-struct Intrinsics {
-  int width_px = 0;
-  int height_px = 0;
-  double f_px = 0.0;
+// Intrinsics aligned for SIMD-friendly access to distortion params
+struct alignas(kCacheLineSize) Intrinsics {
+  double f_px = 0.0;   // Reordered: doubles first for natural alignment
   double cx_px = 0.0;
   double cy_px = 0.0;
   double k1 = 0.0;
   double k2 = 0.0;
+  int width_px = 0;
+  int height_px = 0;
+  int _pad[2] = {0, 0};  // Pad to cache line boundary
 };
 
 struct Pose {

@@ -75,9 +75,9 @@ Eigen::Vector3d AngleAxisFromRotationMatrix(const Eigen::Matrix3d& R) {
 Eigen::Matrix3d RotationMatrixFromAngleAxis(const double aa[3]) {
   double R[9];
   ceres::AngleAxisToRotationMatrix(aa, R);
-  Eigen::Matrix3d M;
-  M << R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8];
-  return M;
+  // Ceres outputs column-major R[9]: R[i + 3*j] = R(i,j)
+  // Use Eigen::Map with ColMajor to avoid manual transposition
+  return Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::ColMajor>>(R);
 }
 
 }  // namespace
