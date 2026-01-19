@@ -1,0 +1,18 @@
+# build artifacts
+/build/
+/cmake-build-*/
+
+# editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# output
+/out/
+*.ply
+bundle.out
+*.yml.gz
+*.yaml.gz
