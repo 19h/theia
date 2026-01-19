@@ -198,7 +198,6 @@ void BundleAdjuster::Adjust(const io::ImageDataset& dataset, sfm::Reconstruction
   options.linear_solver_type = ceres::SPARSE_SCHUR;
   options.minimizer_progress_to_stdout = false;
   options.num_threads = 4;
-  options.num_linear_solver_threads = 4;
 
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);

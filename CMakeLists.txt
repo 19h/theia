@@ -1,12 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(psynth VERSION 0.1.0 LANGUAGES CXX)
+project(psynth VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PSYNTH_BUILD_APPS "Build CLI applications" ON)
+option(PSYNTH_BUILD_VIEWER "Build interactive 3D viewer" ON)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc features2d calib3d flann)
 find_package(Eigen3 REQUIRED)
@@ -50,4 +51,11 @@ endif()
 if(PSYNTH_BUILD_APPS)
   add_executable(psynth_pipeline apps/psynth_pipeline.cpp)
   target_link_libraries(psynth_pipeline PRIVATE psynth)
+endif()
+
+if(PSYNTH_BUILD_VIEWER)
+  find_package(glfw3 3.3 REQUIRED)
+  find_package(OpenGL REQUIRED)
+  find_package(glm REQUIRED)
+  add_subdirectory(src/viewer)
 endif()

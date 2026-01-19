@@ -79,10 +79,10 @@ Eigen::Matrix3d EstimateFundamentalNormalized8Point(const std::vector<Eigen::Vec
 
   Eigen::MatrixXd A(N, 9);
   for (int i = 0; i < N; ++i) {
-    const double x = n1.x;
-    const double y = n1.x;
-    const double xp = n2.x;
-    const double yp = n2.x;
+    const double x = n1.x[i](0);
+    const double y = n1.x[i](1);
+    const double xp = n2.x[i](0);
+    const double yp = n2.x[i](1);
 
     A(i, 0) = xp * x;
     A(i, 1) = xp * y;
